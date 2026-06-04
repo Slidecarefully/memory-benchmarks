@@ -323,7 +323,6 @@ def pair_turns(session: list[dict]) -> list[list[dict]]:
         pairs.append(pair)
     return pairs
 
-
 # ===============================================================================
 # INGESTION
 # ===============================================================================
@@ -344,50 +343,79 @@ async def ingest_question(
 
     Returns: (success, user_id, total_pairs_processed)
     """
+
+    # Step 1: 取出当前问题的 question_id。
     question_id = question["question_id"]
+
+    # Step 2: 为当前问题构造独立的 user_id。
+    # 这样每个 LongMemEval question 都有自己的 Mem0 用户作用域，
+    # 避免不同问题之间的 memories 互相污染。
     user_id = f"longmemeval_{question_id}_{run_id}"
 
+    # Step 3: 初始化 ingestion checkpoint。
+    # checkpoint 用来支持断点续跑，避免重复 ingest 已完成的 pair。
     checkpoint = IngestionCheckpoint(output_dir)
     key = question_id
 
+    # Step 4: 检查该问题是否已经完整 ingest 过。
     # Check if already complete
     is_done, cp_data = checkpoint.is_complete(key, CHUNK_SIZE)
+
+    # Step 5: 如果 checkpoint 显示已完成，则直接返回成功。
     if is_done and cp_data:
         pairs_done = cp_data.get("total_pairs_processed", 0)
         user_id = cp_data.get("user_id", user_id)
+
         logger.info(
             "Question %s already ingested (user_id=%s, %d pairs)",
             question_id, user_id, pairs_done,
         )
+
         return True, user_id, pairs_done
 
+    # Step 6: 检查是否存在部分完成的进度。
     # Check for partial progress
     chunks_already_done, resumed_uid = checkpoint.load_progress(key, CHUNK_SIZE)
+
+    # Step 7: 如果有部分进度，并且 checkpoint 里保存了 user_id，
+    # 则继续使用之前的 user_id，保证续跑时写入同一个 Mem0 用户作用域。
     if resumed_uid and chunks_already_done:
         user_id = resumed_uid
+
         logger.info(
             "Resuming question %s from %d completed pairs",
             question_id, len(chunks_already_done),
         )
 
+    # Step 8: 将当前问题里的 sessions 按时间顺序排序。
     sorted_sessions = sort_sessions_chronologically(question)
 
+    # Step 9: 统计所有 session 中一共有多少个 user/assistant pair。
     # Count total pairs for progress
     total_pairs = sum(len(pair_turns(s)) for _, _, s in sorted_sessions)
 
+    # Step 10: 打印 ingestion 开始日志。
     logger.info(
         "Ingesting question %s: %d sessions, %d pairs",
         question_id, len(sorted_sessions), total_pairs,
     )
 
+    # Step 11: 如果开启 debug，则准备 debug 日志文件。
     # Debug log
     debug_file = None
     if debug:
+        # Step 11.1: 创建 debug 输出目录。
         debug_dir = os.path.join(output_dir, "debug")
         os.makedirs(debug_dir, exist_ok=True)
+
+        # Step 11.2: 构造当前 question 的 debug 文件路径。
         debug_path = os.path.join(debug_dir, f"{question_id}_ingestion.txt")
+
+        # Step 11.3: 如果是续跑，则追加写入；否则重新写入。
         debug_mode = "a" if chunks_already_done else "w"
         debug_file = open(debug_path, debug_mode, encoding="utf-8")
+
+        # Step 11.4: 如果不是续跑，则写入 debug 文件头部信息。
         if not chunks_already_done:
             debug_file.write(f"{'=' * 80}\n")
             debug_file.write(f"QUESTION {question_id} (type={question['question_type']})\n")
@@ -395,22 +423,34 @@ async def ingest_question(
             debug_file.write(f"User ID: {user_id}\n")
             debug_file.write(f"{'=' * 80}\n\n")
 
+    # Step 12: 初始化 ingestion 进度条。
+    # initial 设置为已经完成的 chunk 数量，用于断点续跑。
     pbar = tqdm(
         total=total_pairs,
         desc=f"Ingest {question_id}",
         initial=len(chunks_already_done),
         leave=True,
     )
+
+    # Step 13: 初始化处理成功和失败计数。
     total_processed = len(chunks_already_done)
     total_failed = 0
 
+    # Step 14: 遍历按时间排序后的所有 session。
     for session_idx, (session_id, date_str, session) in enumerate(sorted_sessions):
+
+        # Step 14.1: 空 session 直接跳过。
         if not session:
             continue
 
+        # Step 14.2: 解析 session 的时间戳。
+        # 这个 timestamp 会在 mem0.add 时传入，用于 memory 的时间信息。
         session_timestamp = parse_longmemeval_date(date_str) if date_str else None
+
+        # Step 14.3: 将 session 拆成多个对话 pair。
         pairs = pair_turns(session)
 
+        # Step 14.4: 如果开启 debug，且该 session header 没写过，则写入 session 头部。
         if debug_file and f"s{session_idx}_header" not in chunks_already_done:
             debug_file.write(f"\n{'---' * 27}\n")
             debug_file.write(
@@ -419,22 +459,31 @@ async def ingest_question(
             )
             debug_file.write(f"{'---' * 27}\n\n")
 
+        # Step 15: 遍历当前 session 中的每个 pair。
         for pair_idx, messages in enumerate(pairs):
+            # Step 15.1: 构造当前 pair 的 chunk key。
+            # 例如 s0_p3 表示第 0 个 session 的第 3 个 pair。
             chunk_key = f"s{session_idx}_p{pair_idx}"
 
+            # Step 15.2: 如果该 chunk 已经处理过，则跳过。
             if chunk_key in chunks_already_done:
                 continue
 
+            # Step 15.3: 如果收到优雅退出信号，则保存当前进度并返回。
             if shutdown.requested:
                 logger.info(
                     "Shutdown requested at question %s, chunk %s",
                     question_id, chunk_key,
                 )
+
                 pbar.close()
+
                 if debug_file:
                     debug_file.close()
+
                 return True, user_id, total_processed
 
+            # Step 15.4: 如果 pair 里有空 content，则跳过该 pair。
             # Skip pairs with empty content
             if any(not msg.get("content", "").strip() for msg in messages):
                 chunks_already_done.add(chunk_key)
@@ -442,33 +491,49 @@ async def ingest_question(
                 pbar.update(1)
                 continue
 
+            # Step 15.5: 如果开启 debug，则把当前 pair 的原始消息写入 debug 文件。
             if debug_file:
                 debug_file.write(f"--- Pair {pair_idx} ({len(messages)} messages) ---\n")
+
                 for msg in messages:
                     debug_file.write(f"  {msg['role']}: {msg['content'][:200]}\n")
+
                 debug_file.write("\n")
 
+            # Step 15.6: 调用 mem0.add，将当前 pair 写入 Mem0。
+            # 这里会触发 Mem0 的 memory extraction / add pipeline。
             response = await mem0.add(messages, user_id, timestamp=session_timestamp)
 
+            # Step 15.7: 如果 mem0.add 有返回结果，则认为当前 pair 处理成功。
             if response is not None:
                 total_processed += 1
+
+                # Step 15.8: 如果开启 debug，则把本次抽取出的 memories 写入 debug 文件。
                 if debug_file:
                     results = response.get("results", [])
+
                     if results:
                         debug_file.write(f"--- Pair {pair_idx} (extracted) ---\n")
+
                         for mem_item in results:
                             mem_text = mem_item.get("memory", "")
                             event_type = mem_item.get("event", "")
                             debug_file.write(f"  [{event_type}] {mem_text}\n")
+
                         debug_file.write("\n")
             else:
+                # Step 15.9: 如果 mem0.add 返回 None，则认为 ingestion 失败。
                 total_failed += 1
+
                 logger.warning(
                     "Ingestion failed: %s session %d pair %d",
                     question_id, session_idx, pair_idx,
                 )
 
+            # Step 15.10: 无论成功或失败，都把当前 chunk 标记为已完成。
             chunks_already_done.add(chunk_key)
+
+            # Step 15.11: 保存当前 question 的 ingestion 进度。
             checkpoint.save_progress(key, {
                 "question_id": question_id,
                 "user_id": user_id,
@@ -476,19 +541,27 @@ async def ingest_question(
                 "chunk_size": CHUNK_SIZE,
                 "completed_chunks": list(chunks_already_done),
             })
+
+            # Step 15.12: 更新进度条描述，若有失败则显示失败数量。
             pbar.set_description(
                 f"Ingest {question_id}"
                 + (f" [!fail={total_failed}]" if total_failed else "")
             )
+
+            # Step 15.13: 更新进度条。
             pbar.update(1)
 
+    # Step 16: 所有 session / pair 处理完成，关闭进度条。
     pbar.close()
+
+    # Step 17: 如果开启 debug，则写入 summary 并关闭文件。
     if debug_file:
         debug_file.write(
             f"\nSUMMARY: {total_processed}/{total_pairs} OK, {total_failed} failed\n"
         )
         debug_file.close()
 
+    # Step 18: 保存完整完成的 checkpoint。
     checkpoint.save_complete(key, {
         "question_id": question_id,
         "user_id": user_id,
@@ -498,6 +571,8 @@ async def ingest_question(
         "total_pairs_failed": total_failed,
     })
 
+    # Step 19: 返回 ingestion 结果。
+    # total_failed == 0 表示整体成功。
     return total_failed == 0, user_id, total_processed
 
 
