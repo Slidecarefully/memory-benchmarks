@@ -599,30 +599,42 @@ async def process_question_answerer(
 
     Returns a result dict suitable for serialization.
     """
+
+    # Step 1: 从 question 中取出基础字段。
     question_id = question["question_id"]
     question_text = question["question"]
     question_type = question["question_type"]
     answer = str(question["answer"])
     question_date = question.get("question_date", "")
 
+    # Step 2: 将问题日期转换成人类可读格式，供 answerer prompt 使用。
     # Human-readable question date for the answerer prompt
     question_date_human = (
         parse_longmemeval_date_human(question_date) if question_date else ""
     )
 
+    # Step 3: 执行搜索阶段。
     # --- Search ---
     if existing_search_results is not None:
+        # Step 3.1: 如果已有 search 结果，则直接复用，不再调用 Mem0 search。
         formatted = existing_search_results
         query_debug = None
         search_latency = 0.0
     else:
+        # Step 3.2: 否则调用 mem0.search 搜索相关 memories。
         start = time.monotonic()
+
         search_results = await mem0.search(
             question_text, user_id, top_k=top_k, score_debug=score_debug,
         )
+
+        # Step 3.3: 计算搜索耗时，单位毫秒。
         search_latency = (time.monotonic() - start) * 1000
+
+        # Step 3.4: 格式化 search 结果，并提取 debug 信息。
         formatted, query_debug = format_search_results(search_results)
 
+    # Step 4: 构造当前问题的基础 result。
     result: dict[str, Any] = {
         "question_id": question_id,
         "question_type": question_type,
@@ -639,25 +651,36 @@ async def process_question_answerer(
             "total_results": len(formatted),
         },
     }
+
+    # Step 5: 如果存在 query_debug，则写入 result。
     if query_debug:
         result["retrieval"]["query_debug"] = query_debug
+
+    # Step 6: 如果存在 user_profile，则写入 result。
     if user_profile:
         result["user_profile"] = user_profile
 
+    # Step 7: 如果是 predict_only 模式，只返回搜索结果，不生成答案、不 judge。
     if predict_only:
         return result
 
+    # Step 8: 初始化不同 cutoff 下的评测结果。
     # --- Answer + Judge at each cutoff ---
     cutoff_results: dict[str, dict] = {}
 
+    # Step 9: 遍历每个 cutoff，例如 top_5 / top_10 / top_20。
     for c in cutoffs:
+        # Step 9.1: 截取前 c 条搜索结果。
         sliced = formatted[:c]
 
+        # Step 9.2: 按 created_at 排序，让 answerer 看到自然时间线。
         # Sort chronologically for the answerer (natural timeline)
         sliced_chrono = sorted(sliced, key=lambda x: x.get("created_at") or "")
 
+        # Step 9.3: 构造 cutoff label。
         label = cutoff_label(c)
 
+        # Step 9.4: 构造 answer generation prompt。
         # Generate answer
         gen_prompt = get_answer_generation_prompt(
             question=question_text,
@@ -665,8 +688,11 @@ async def process_question_answerer(
             question_date=question_date_human,
             user_profile=user_profile,
         )
+
+        # Step 9.5: 调用 answerer LLM 生成答案。
         generated_answer = await answerer.generate(system="", user=gen_prompt)
 
+        # Step 9.6: 删除可能存在的 chain-of-thought / mem_thinking 标签内容。
         # Strip chain-of-thought tags
         generated_answer = re.sub(
             r"[<\[]mem_thinking[>\]].*?[<\[]/mem_thinking[>\]]",
@@ -674,9 +700,12 @@ async def process_question_answerer(
             generated_answer,
             flags=re.DOTALL,
         ).strip()
+
+        # Step 9.7: 如果答案中包含 ANSWER:，只保留 ANSWER: 后面的内容。
         if "ANSWER:" in generated_answer:
             generated_answer = generated_answer.rsplit("ANSWER:", 1)[-1].strip()
 
+        # Step 9.8: 构造 judge prompt。
         # Judge: yes/no correctness
         judge_prompt = get_judge_prompt(
             question_type=question_type,
@@ -686,10 +715,15 @@ async def process_question_answerer(
             response=generated_answer,
             question_date=question_date_human,
         )
+
+        # Step 9.9: 调用 judge LLM 判断答案是否正确。
         correct, judge_raw = await judge_llm.judge_yes_no(judge_prompt)
+
+        # Step 9.10: 将 judge 结果转换为 score 和 judgment。
         score = 1.0 if correct else 0.0
         judgment = "PASS" if correct else "FAIL"
 
+        # Step 9.11: 保存当前 cutoff 下的评测结果。
         cutoff_results[label] = {
             "judgment": judgment,
             "score": score,
@@ -699,7 +733,10 @@ async def process_question_answerer(
             "reason": f"Generated answer: {generated_answer[:500]}",
         }
 
+    # Step 10: 将所有 cutoff 结果写入 result。
     result["cutoff_results"] = cutoff_results
+
+    # Step 11: 返回完整结果。
     return result
 
 
@@ -719,21 +756,29 @@ async def process_question_retrieval(
 
     Returns a result dict suitable for serialization.
     """
+
+    # Step 1: 从 question 中取出基础字段。
     question_id = question["question_id"]
     question_text = question["question"]
     question_type = question["question_type"]
     answer = str(question["answer"])
     question_date = question.get("question_date", "")
 
+    # Step 2: 调用 Mem0 search 检索相关 memories。
     # --- Search ---
     start = time.monotonic()
+
     search_results = await mem0.search(
         question_text, user_id, top_k=top_k, score_debug=score_debug,
     )
+
+    # Step 3: 计算 search 耗时，单位毫秒。
     search_latency = (time.monotonic() - start) * 1000
 
+    # Step 4: 格式化搜索结果和 query debug 信息。
     formatted, query_debug = format_search_results(search_results)
 
+    # Step 5: 构造基础 result。
     result: dict[str, Any] = {
         "question_id": question_id,
         "question_type": question_type,
@@ -750,21 +795,32 @@ async def process_question_retrieval(
             "total_results": len(formatted),
         },
     }
+
+    # Step 6: 如果有 query_debug，则写入 retrieval。
     if query_debug:
         result["retrieval"]["query_debug"] = query_debug
+
+    # Step 7: 如果有 user_profile，则写入 result。
     if user_profile:
         result["user_profile"] = user_profile
 
+    # Step 8: predict_only 模式下，只返回检索结果，不做 judge。
     if predict_only:
         return result
 
+    # Step 9: 初始化各个 cutoff 下的 judge 结果。
     # --- Judge at each cutoff ---
     cutoff_results: dict[str, dict] = {}
 
+    # Step 10: 遍历每个 cutoff。
     for c in cutoffs:
+        # Step 10.1: 取前 c 条检索结果。
         sliced = formatted[:c]
+
+        # Step 10.2: 构造 cutoff label。
         label = cutoff_label(c)
 
+        # Step 10.3: 构造 retrieval judge prompt。
         prompt = get_retrieval_judge_prompt(
             question=question_text,
             answer=answer,
@@ -772,20 +828,26 @@ async def process_question_retrieval(
             question_date=question_date,
             user_profile=user_profile,
         )
+
+        # Step 10.4: 调用 judge LLM，要求输出结构化结果。
         raw = await judge_llm.generate_structured(
             system=RETRIEVAL_JUDGE_SYSTEM,
             user=prompt,
         )
 
+        # Step 10.5: 如果 raw 是 dict，则读取 judgment 字段。
         if isinstance(raw, dict):
             judgment_str = raw.get("judgment", "").upper()
             passed = judgment_str == "PASS"
         else:
+            # Step 10.6: 如果返回格式异常，则认为失败。
             passed = False
 
+        # Step 10.7: 转换为 score 和 judgment。
         score = 1.0 if passed else 0.0
         judgment = "PASS" if passed else "FAIL"
 
+        # Step 10.8: 保存当前 cutoff 的评测结果。
         cutoff_results[label] = {
             "judgment": judgment,
             "score": score,
@@ -796,7 +858,10 @@ async def process_question_retrieval(
             "core_intent_supported": raw.get("core_intent_supported", False) if isinstance(raw, dict) else False,
         }
 
+    # Step 11: 写入 cutoff_results。
     result["cutoff_results"] = cutoff_results
+
+    # Step 12: 返回完整结果。
     return result
 
 
@@ -807,7 +872,12 @@ async def apply_longmemeval_answerer_judge_to_saved_result(
     cutoffs: list[int],
 ) -> None:
     """Fill ``cutoff_results`` from ``retrieval.search_results`` (no Mem0)."""
+
+    # Step 1: 从已有 result 中读取 search_results。
+    # 该函数不再调用 Mem0，只基于已保存的 retrieval 结果重新生成 cutoff_results。
     formatted = list(result["retrieval"]["search_results"])
+
+    # Step 2: 读取问题基础字段。
     question_text = result["question"]
     question_id = result["question_id"]
     question_type = result["question_type"]
@@ -815,32 +885,49 @@ async def apply_longmemeval_answerer_judge_to_saved_result(
     question_date = result.get("question_date", "")
     user_profile = result.get("user_profile")
 
+    # Step 3: 将 question_date 转成人类可读形式。
     question_date_human = (
         parse_longmemeval_date_human(question_date) if question_date else ""
     )
 
+    # Step 4: 初始化 cutoff_results。
     cutoff_results: dict[str, dict] = {}
+
+    # Step 5: 遍历每个 cutoff。
     for c in cutoffs:
+        # Step 5.1: 取前 c 条 search results。
         sliced = formatted[:c]
+
+        # Step 5.2: 按时间顺序排序，供 answerer 生成答案。
         sliced_chrono = sorted(sliced, key=lambda x: x.get("created_at") or "")
+
+        # Step 5.3: 构造 cutoff label。
         label = cutoff_label(c)
 
+        # Step 5.4: 构造 answer generation prompt。
         gen_prompt = get_answer_generation_prompt(
             question=question_text,
             search_results=sliced_chrono,
             question_date=question_date_human,
             user_profile=user_profile,
         )
+
+        # Step 5.5: 调用 answerer 生成答案。
         generated_answer = await answerer.generate(system="", user=gen_prompt)
+
+        # Step 5.6: 清理 mem_thinking 标签内容。
         generated_answer = re.sub(
             r"[<\[]mem_thinking[>\]].*?[<\[]/mem_thinking[>\]]",
             "",
             generated_answer,
             flags=re.DOTALL,
         ).strip()
+
+        # Step 5.7: 如果包含 ANSWER:，只保留最终答案部分。
         if "ANSWER:" in generated_answer:
             generated_answer = generated_answer.rsplit("ANSWER:", 1)[-1].strip()
 
+        # Step 5.8: 构造 judge prompt。
         judge_prompt = get_judge_prompt(
             question_type=question_type,
             question_id=question_id,
@@ -849,10 +936,15 @@ async def apply_longmemeval_answerer_judge_to_saved_result(
             response=generated_answer,
             question_date=question_date_human,
         )
+
+        # Step 5.9: 调用 judge LLM 判断答案是否正确。
         correct, judge_raw = await judge_llm.judge_yes_no(judge_prompt)
+
+        # Step 5.10: 转换 judge 结果。
         score = 1.0 if correct else 0.0
         judgment = "PASS" if correct else "FAIL"
 
+        # Step 5.11: 保存当前 cutoff 结果。
         cutoff_results[label] = {
             "judgment": judgment,
             "score": score,
@@ -862,6 +954,7 @@ async def apply_longmemeval_answerer_judge_to_saved_result(
             "reason": f"Generated answer: {generated_answer[:500]}",
         }
 
+    # Step 6: 将生成的 cutoff_results 写回 result。
     result["cutoff_results"] = cutoff_results
 
 
@@ -871,16 +964,29 @@ async def apply_longmemeval_retrieval_judge_to_saved_result(
     cutoffs: list[int],
 ) -> None:
     """Fill ``cutoff_results`` using retrieval-judge prompts (no Mem0)."""
+
+    # Step 1: 从已有 result 中读取 search_results。
+    # 这个函数只重新 judge，不再调用 Mem0 search。
     formatted = list(result["retrieval"]["search_results"])
+
+    # Step 2: 读取问题基础字段。
     question_text = result["question"]
     answer = str(result["ground_truth_answer"])
     question_date = result.get("question_date", "")
     user_profile = result.get("user_profile")
 
+    # Step 3: 初始化 cutoff_results。
     cutoff_results: dict[str, dict] = {}
+
+    # Step 4: 遍历每个 cutoff。
     for c in cutoffs:
+        # Step 4.1: 取前 c 条检索结果。
         sliced = formatted[:c]
+
+        # Step 4.2: 构造 cutoff label。
         label = cutoff_label(c)
+
+        # Step 4.3: 构造 retrieval judge prompt。
         prompt = get_retrieval_judge_prompt(
             question=question_text,
             answer=answer,
@@ -888,17 +994,26 @@ async def apply_longmemeval_retrieval_judge_to_saved_result(
             question_date=question_date,
             user_profile=user_profile,
         )
+
+        # Step 4.4: 调用 judge LLM 生成结构化判断结果。
         raw = await judge_llm.generate_structured(
             system=RETRIEVAL_JUDGE_SYSTEM,
             user=prompt,
         )
+
+        # Step 4.5: 解析 judgment 字段。
         if isinstance(raw, dict):
             judgment_str = raw.get("judgment", "").upper()
             passed = judgment_str == "PASS"
         else:
+            # Step 4.6: 返回结构异常时，默认判失败。
             passed = False
+
+        # Step 4.7: 转换为 score 和 judgment。
         score = 1.0 if passed else 0.0
         judgment = "PASS" if passed else "FAIL"
+
+        # Step 4.8: 保存当前 cutoff 的 retrieval judge 结果。
         cutoff_results[label] = {
             "judgment": judgment,
             "score": score,
@@ -909,27 +1024,46 @@ async def apply_longmemeval_retrieval_judge_to_saved_result(
             "core_intent_supported": raw.get("core_intent_supported", False) if isinstance(raw, dict) else False,
         }
 
+    # Step 5: 将 cutoff_results 写回 result。
     result["cutoff_results"] = cutoff_results
-
 
 def longmemeval_predict_outputs_complete(
     output_dir: str,
     question_ids: list[str],
 ) -> tuple[bool, list[str]]:
+    # Step 1: 初始化 missing 列表。
+    # 用于记录缺失、不可读、或没有 search_results 的 question_id。
     missing: list[str] = []
+
+    # Step 2: 遍历预期应该存在预测结果的所有 question_id。
     for qid in question_ids:
+        # Step 2.1: 构造该 question 对应的结果文件路径。
         path = os.path.join(output_dir, f"{qid}.json")
+
+        # Step 2.2: 如果文件不存在，则记录为 missing。
         if not os.path.isfile(path):
             missing.append(qid)
             continue
+
         try:
+            # Step 2.3: 尝试读取并解析 JSON 文件。
             data = json.loads(Path(path).read_text())
         except (json.JSONDecodeError, OSError):
+            # Step 2.4: 如果 JSON 不可读或文件读取失败，也记录为 missing。
             missing.append(f"{qid} (unreadable)")
             continue
+
+        # Step 2.5: 检查 retrieval 字段。
         retr = data.get("retrieval") or {}
+
+        # Step 2.6: 如果没有 search_results，说明 predict 输出不完整。
         if "search_results" not in retr:
             missing.append(f"{qid} (no search_results)")
+
+    # Step 3: 如果 missing 为空，说明所有输出完整。
+    # 返回：
+    # - complete: bool
+    # - missing: list[str]
     return len(missing) == 0, missing
 
 
