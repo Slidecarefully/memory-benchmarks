@@ -1053,20 +1053,40 @@ def parse_args() -> argparse.Namespace:
 
 
 async def async_main() -> None:
+    # Step 1: 解析命令行参数。
+    # args 中包含 benchmark 模式、模型配置、数据集路径、top_k、并发数、输出目录等配置。
     args = parse_args()
+
+    # Step 2: 初始化日志系统。
+    # 如果 args.debug=True，则开启更详细的 debug 日志。
     logger = setup_logging("longmemeval", debug=args.debug)
 
+    # Step 3: 解析 top_k_cutoffs。
+    # 例如用户传入 "5,10,20"，这里会转成可用于评测的 cutoff 列表。
     cutoffs = parse_cutoffs(args.top_k_cutoffs)
+
+    # Step 4: 解析要处理的问题类型。
+    # 如果 args.question_types 非空，就按逗号拆分成列表；
+    # 如果为空，则 selected_types=None，表示不限制问题类型。
     selected_types = (
         [t.strip() for t in args.question_types.split(",") if t.strip()]
         if args.question_types
         else None
     )
 
+    # Step 5: 确定本次运行的 run_id。
+    # 如果用户传了 args.run_id，就用用户指定的；
+    # 否则随机生成一个 8 位短 uuid。
     run_id = args.run_id or uuid.uuid4().hex[:8]
+
+    # Step 6: 构造本次预测结果输出目录。
+    # 目录名格式为 predicted_{project_name}。
     output_dir = os.path.join(args.output_dir, f"predicted_{args.project_name}")
+
+    # Step 7: 确保输出目录存在。
     os.makedirs(output_dir, exist_ok=True)
 
+    # Step 8: 打印本次 benchmark 的基本运行信息。
     print(f"LongMemEval Benchmark | project={args.project_name} run_id={run_id}")
     print(f"  Mode: {args.mode}")
     print(f"  Answerer: {args.answerer_model} ({args.provider})")
@@ -1074,58 +1094,88 @@ async def async_main() -> None:
     print(f"  Cutoffs: {args.top_k_cutoffs}")
     print(f"  Top-K: {args.top_k}")
 
+    # Step 9: 加载数据集。
     # Load dataset
     if args.dataset_path:
+        # Step 9.1: 如果用户指定了数据集路径，则直接使用该路径。
         dataset_path = args.dataset_path
     else:
+        # Step 9.2: 否则下载默认数据集。
         dataset_path = download_dataset(DEFAULT_DATASET_DIR, logger)
+
+    # Step 9.3: 从数据集路径中加载所有问题。
     all_questions = load_dataset(dataset_path)
 
+    # Step 9.4: 打印加载到的问题总数。
     print(f"  Dataset: {len(all_questions)} questions loaded")
 
+    # Step 10: 根据参数决定处理全部问题，还是抽样处理部分问题。
     # Sample / filter questions
     if args.all_questions:
+        # Step 10.1: 如果指定处理全部问题，并且指定了问题类型，则按类型过滤。
         if selected_types:
             questions_to_process = [
                 q for q in all_questions
                 if q["question_type"] in set(selected_types)
             ]
         else:
+            # Step 10.2: 如果没有指定类型，则处理全部问题。
             questions_to_process = all_questions
+
+        # Step 10.3: 打印将要处理的问题数量。
         print(f"  Processing all {len(questions_to_process)} questions")
     else:
+        # Step 10.4: 如果不处理全部问题，则按问题类型分层抽样。
         questions_to_process = sample_questions_stratified(
             all_questions,
             per_type=args.per_type,
             seed=args.seed,
             selected_types=selected_types,
         )
+
+        # Step 10.5: 打印抽样后的问题数量。
         print(
             f"  Sampled {len(questions_to_process)} questions "
             f"({args.per_type} per type)"
         )
 
+    # Step 11: 统计并打印本次处理的问题类型分布。
     # Print type distribution
     type_counts: dict[str, int] = defaultdict(int)
     for q in questions_to_process:
         type_counts[q["question_type"]] += 1
+
     for qtype in sorted(type_counts.keys()):
         print(f"    {qtype}: {type_counts[qtype]}")
 
+    # Step 12: 初始化 answerer LLM。
+    # answerer 负责根据检索到的 memory 生成答案。
     answerer = LLMClient(
         model=args.answerer_model, provider=args.provider, rpm=args.rpm,
     )
+
+    # Step 13: 初始化 judge LLM。
+    # 如果用户指定了 judge_provider，就用 judge_provider；
+    # 否则默认和 answerer 使用同一个 provider。
     judge_provider = args.judge_provider or args.provider
     judge_llm = LLMClient(
         model=args.judge_model, provider=judge_provider, rpm=args.rpm,
     )
 
+    # Step 14: 如果开启 evaluate_only，则只做评测，不再重新执行 Mem0 ingest/search。
     if args.evaluate_only:
+        # Step 14.1: 如果没有要处理的问题，直接结束。
         if not questions_to_process:
             print("No questions in scope.")
             return
+
+        # Step 14.2: 提取本次应该评测的问题 id。
         expected_ids = [q["question_id"] for q in questions_to_process]
+
+        # Step 14.3: 检查预测结果文件是否已经全部存在。
         complete, missing = longmemeval_predict_outputs_complete(output_dir, expected_ids)
+
+        # Step 14.4: 如果预测结果不完整，则不能 evaluate-only，直接退出。
         if not complete:
             print(
                 "Evaluate-only aborted: not all predict outputs are on disk. "
@@ -1133,81 +1183,128 @@ async def async_main() -> None:
             )
             print(f"  Missing or invalid: {len(missing)} (showing up to 25): {missing[:25]}")
             return
+
+        # Step 14.5: 预测结果完整，开始只跑 judge 阶段。
         print(f"  Predict complete ({len(expected_ids)} questions). Running judge phase (no Mem0)...")
 
+        # Step 14.6: 创建并发控制 semaphore，限制 judge 并发数量。
         sem = asyncio.Semaphore(args.max_workers)
+
+        # Step 14.7: 初始化进度统计。
         progress = {"done": 0, "total": len(questions_to_process)}
+
+        # Step 14.8: 初始化 live_scores，用于实时展示不同 cutoff 下的通过率。
         live_scores = {
             cutoff_label(c): {"seen": 0, "passed": 0}
             for c in cutoffs
         }
+
+        # Step 14.9: 创建异步锁，保护进度更新。
         progress_lock = asyncio.Lock()
+
+        # Step 14.10: 初始化进度条。
         pbar = tqdm(total=progress["total"], desc="Rejudge", leave=True)
 
+        # Step 14.11: 定义内部函数，用于更新进度条右侧的实时分数摘要。
         def update_progress_postfix(data: dict) -> None:
+            # Step 14.11.1: 取出当前问题不同 cutoff 下的 judge 结果。
             cutoff_results = data.get("cutoff_results", {})
+
+            # Step 14.11.2: 遍历每个 cutoff，累计 seen / passed。
             for label in live_scores:
                 result = cutoff_results.get(label)
                 if not result:
                     continue
+
                 live_scores[label]["seen"] += 1
+
+                # Step 14.11.3: score >= 0.5 视为通过。
                 if result.get("score", 0.0) >= 0.5:
                     live_scores[label]["passed"] += 1
 
+            # Step 14.11.4: 构造进度条 postfix 中展示的通过率摘要。
             summary = {}
             for label, stats in live_scores.items():
                 seen = stats["seen"]
                 if not seen:
                     continue
                 summary[label.replace("top_", "t")] = f"{(stats['passed'] / seen) * 100:.1f}%"
+
+            # Step 14.11.5: 如果有摘要，则更新进度条展示。
             if summary:
                 pbar.set_postfix(summary)
 
+        # Step 14.12: 定义内部异步函数，负责重新 judge 单个问题。
         async def judge_one(question: dict) -> None:
+            # Step 14.12.1: 获取问题 id，并定位该问题已有的预测结果 JSON 文件。
             qid = question["question_id"]
             path = os.path.join(output_dir, f"{qid}.json")
+
+            # Step 14.12.2: 读取已有预测结果。
             data = json.loads(Path(path).read_text())
+
+            # Step 14.12.3: 如果该结果已经有 cutoff_results，并且没有指定 rejudge，则跳过重评。
             if data.get("cutoff_results") and not args.rejudge:
                 async with progress_lock:
                     update_progress_postfix(data)
                     progress["done"] += 1
                     pbar.update(1)
                 return
+
+            # Step 14.12.4: 使用 semaphore 控制 judge 并发。
             async with sem:
+                # Step 14.12.5: 如果是 retrieval 模式，使用 retrieval judge。
                 if args.mode == "retrieval":
                     await apply_longmemeval_retrieval_judge_to_saved_result(
                         data, judge_llm, cutoffs,
                     )
                 else:
+                    # Step 14.12.6: 否则使用 answerer judge。
                     await apply_longmemeval_answerer_judge_to_saved_result(
                         data, answerer, judge_llm, cutoffs,
                     )
+
+                # Step 14.12.7: 保存更新后的 judge 结果。
                 save_result_json(path, data)
+
+            # Step 14.12.8: 更新全局进度条和 live score。
             async with progress_lock:
                 update_progress_postfix(data)
                 progress["done"] += 1
                 pbar.update(1)
 
+        # Step 14.13: 并发执行所有问题的 judge_one。
         await asyncio.gather(*[judge_one(q) for q in questions_to_process])
+
+        # Step 14.14: 关闭进度条。
         pbar.close()
 
+        # Step 14.15: 重新读取所有评测结果。
         all_evaluations = [
             json.loads(Path(os.path.join(output_dir, f"{qid}.json")).read_text())
             for qid in expected_ids
         ]
+
+        # Step 14.16: 计算 LongMemEval 指标。
         metrics = compute_longmemeval_metrics(all_evaluations, cutoffs)
+
+        # Step 14.17: 在终端展示指标结果。
         display_results(metrics, cutoffs)
 
+        # Step 14.18: 记录 metadata 中使用的 run_id。
         run_id_meta = args.run_id or run_id
 
+        # Step 14.19: 生成统一结果文件名。
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         unified_path = os.path.join(
             args.output_dir, f"longmemeval_results_{timestamp}.json",
         )
+
+        # Step 14.20: 保存统一汇总结果 JSON。
         save_result_json(unified_path, {
             "metadata": {
                 "benchmark": "longmemeval",
-                "project_name": args.project_name,
+                "project_name": args.project_name",
                 "run_id": run_id_meta,
                 "timestamp": timestamp,
                 "mode": args.mode,
@@ -1226,69 +1323,119 @@ async def async_main() -> None:
             "metrics_by_cutoff": metrics,
             "evaluations": all_evaluations,
         })
+
+        # Step 14.21: 打印结果路径和评测数量。
         print(f"\nResults saved to: {unified_path}")
         print(f"\nTotal questions evaluated: {len(all_evaluations)}")
+
+        # Step 14.22: evaluate_only 模式到这里结束。
         return
 
+    # Step 15: 非 evaluate_only 模式下，初始化 Mem0 后端。
+    # 优先读取环境变量 MEM0_BACKEND，否则使用 args.backend。
     backend = os.getenv("MEM0_BACKEND", args.backend)
+
+    # Step 16: 创建 Mem0Client。
+    # 如果 backend == "cloud"，则传入 api_key；
+    # 否则本地模式不使用 api_key。
     mem0 = Mem0Client(
         mode=backend,
         host=args.mem0_host,
         api_key=args.mem0_api_key if backend == "cloud" else None,
         rpm=args.rpm,
     )
+
+    # Step 17: 初始化优雅退出控制器。
+    # 用于处理中断信号，避免任务中途硬退出。
     shutdown = GracefulShutdown()
+
+    # Step 18: 初始化 checkpoint 管理器。
+    # 注意：这段代码里 checkpoint 被创建，但在当前片段中没有继续使用。
     checkpoint = Checkpoint(output_dir)
 
+    # Step 19: 初始化评测结果列表。
     all_evaluations: list[dict] = []
 
+    # Step 20: 如果开启 resume，则从输出目录中加载已有结果。
     if args.resume:
+        # Step 20.1: 遍历输出目录下所有 json 文件。
         for p in sorted(Path(output_dir).glob("*.json")):
+            # Step 20.2: 跳过以下划线开头的内部文件。
             if p.name.startswith("_"):
                 continue
+
             try:
+                # Step 20.3: 读取已有结果文件。
                 data = json.loads(p.read_text())
+
+                # Step 20.4: 如果文件里有 question_type，则认为是有效问题结果。
                 if data.get("question_type"):
                     all_evaluations.append(data)
             except (json.JSONDecodeError, KeyError):
+                # Step 20.5: 如果 JSON 损坏或字段异常，跳过该文件。
                 continue
+
+        # Step 20.6: 打印恢复出的已有结果数量。
         print(f"  Loaded {len(all_evaluations)} existing results")
 
+    # Step 21: 构造已有 question_id 集合，用于避免重复处理。
     existing_ids = {e["question_id"] for e in all_evaluations}
 
+    # Step 22: 进入 Mem0Client 异步上下文。
+    # 这里负责打开/关闭 Mem0 相关资源。
     async with mem0:
+        # Step 23: 进入优雅退出上下文。
         with shutdown:
+            # Step 24: 创建锁，用于保护 all_evaluations 和 existing_ids 的并发写入。
             results_lock = asyncio.Lock()
+
+            # Step 25: 创建问题级 semaphore，限制同时处理的问题数量。
             question_semaphore = asyncio.Semaphore(args.max_workers)
+
+            # Step 26: 初始化处理进度。
             progress = {"done": 0, "total": len(questions_to_process)}
+
+            # Step 27: 创建问题处理进度条。
             pbar = tqdm(total=progress["total"], desc="Questions", leave=True)
 
+            # Step 28: 从已有结果中找出 predict-only 结果。
+            # 这些结果已经有 retrieval/search 数据，但还没有 cutoff_results。
             # Build lookup of predict-only results (have search data but no cutoff_results)
             predict_only_results = {
                 e["question_id"]: e for e in all_evaluations
                 if "retrieval" in e and "cutoff_results" not in e
             }
 
+            # Step 29: 定义单个问题的完整处理流程。
             async def process_single_question(question: dict):
+                # Step 29.1: 用 semaphore 限制并发问题数量。
                 async with question_semaphore:
+                    # Step 29.2: 如果收到退出信号，直接返回。
                     if shutdown.requested:
                         return
 
+                    # Step 29.3: 获取当前问题 id。
                     question_id = question["question_id"]
 
+                    # Step 29.4: 加锁检查当前问题是否已经处理过。
                     async with results_lock:
                         if question_id in existing_ids:
                             progress["done"] += 1
                             pbar.update(1)
                             return
 
+                    # Step 29.5: 检查当前问题是否已有 predict-only 结果。
                     # Check if we have predict-only results (search data already exists)
                     existing_predict = predict_only_results.get(question_id)
+
                     if existing_predict and existing_predict.get("retrieval"):
+                        # Step 29.6: 如果已有 search 结果，则跳过 ingest+search，
+                        # 后面直接复用已有 retrieval 结果。
                         # Skip ingest+search, use existing search results
                         user_id = existing_predict.get("user_id", f"longmemeval_{question_id}_{run_id}")
                         user_profile = None
                     else:
+                        # Step 29.7: 如果没有可复用结果，则先执行 Mem0 ingestion。
                         # --- Ingest ---
                         success, user_id, pairs = await ingest_question(
                             question=question,
@@ -1299,23 +1446,31 @@ async def async_main() -> None:
                             shutdown=shutdown,
                             debug=args.debug,
                         )
+
+                        # Step 29.8: 如果 ingestion 失败，记录错误。
                         if not success:
                             logger.error(
                                 "Ingestion failed for question %s", question_id,
                             )
 
+                        # Step 29.9: ingestion 后再次检查是否收到退出信号。
                         if shutdown.requested:
                             return
 
+                        # Step 29.10: 标记没有已有 predict 结果，后续需要 fresh search。
                         existing_predict = None  # will search fresh below
 
+                    # Step 29.11: 如果用户要求 user_profile，则从 Mem0 读取 user profile。
                     # Fetch user profile if requested
                     user_profile = None
                     if args.user_profile:
                         user_profile = await mem0.get_user_profile(user_id)
 
+                    # Step 29.12: 根据 mode 执行 retrieval-only 或 answerer 模式。
                     # --- Search + Answer/Judge ---
                     if args.mode == "retrieval":
+                        # Step 29.13: retrieval 模式：
+                        # 只处理检索结果，并用 judge 评估检索是否命中答案。
                         result = await process_question_retrieval(
                             question=question,
                             user_id=user_id,
@@ -1329,11 +1484,16 @@ async def async_main() -> None:
                             score_debug=args.score_debug,
                         )
                     else:
+                        # Step 29.14: answerer 模式：
+                        # 使用检索结果作为上下文，让 answerer 生成答案，再用 judge 评估答案。
                         # Use existing search results from predict-only run if available
                         existing_search = None
+
+                        # Step 29.15: 如果有已有 predict-only retrieval 结果，则复用其中的 search_results。
                         if existing_predict and existing_predict.get("retrieval"):
                             existing_search = existing_predict["retrieval"].get("search_results", [])
 
+                        # Step 29.16: 执行 answerer 流程。
                         result = await process_question_answerer(
                             question=question,
                             user_id=user_id,
@@ -1349,36 +1509,60 @@ async def async_main() -> None:
                             existing_search_results=existing_search,
                         )
 
+                    # Step 29.17: 保存当前问题的结果到单独 JSON 文件。
                     # Save per-question result
                     result_path = os.path.join(output_dir, f"{question_id}.json")
                     save_result_json(result_path, result)
+
+                    # Step 29.18: 加锁更新全局结果列表和已处理 id 集合。
                     async with results_lock:
                         all_evaluations.append(result)
                         existing_ids.add(question_id)
+
+                    # Step 29.19: 更新进度条。
                     pbar.update(1)
 
+            # Step 30: 为所有问题创建异步任务。
             tasks = [process_single_question(q) for q in questions_to_process]
+
+            # Step 31: 并发执行所有问题处理任务。
             await asyncio.gather(*tasks)
+
+            # Step 32: 所有任务结束后关闭进度条。
             pbar.close()
 
+    # Step 33: 如果不是 predict_only，并且已有评测结果，则计算最终指标。
     # --- Metrics ---
     if not args.predict_only and all_evaluations:
+        # Step 33.1: 按 question_id 去重。
+        # 如果同一个 question_id 出现多次，保留最后一次结果。
         # Deduplicate by question_id, keeping the latest (last) entry
         seen = {}
         for e in all_evaluations:
             seen[e.get("question_id")] = e
+
+        # Step 33.2: 得到去重后的结果列表。
         deduped = list(seen.values())
 
+        # Step 33.3: 检查是否有 cutoff_results。
+        # 只有已经 judge 过的结果才会包含 cutoff_results。
         has_cutoffs = any("cutoff_results" in e for e in deduped)
+
         if has_cutoffs:
+            # Step 33.4: 计算 LongMemEval 指标。
             metrics = compute_longmemeval_metrics(deduped, cutoffs)
+
+            # Step 33.5: 打印指标。
             display_results(metrics, cutoffs)
 
+            # Step 33.6: 保存统一汇总结果。
             # Save unified result
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             unified_path = os.path.join(
                 args.output_dir, f"longmemeval_results_{timestamp}.json",
             )
+
+            # Step 33.7: 写入统一结果 JSON 文件。
             save_result_json(unified_path, {
                 "metadata": {
                     "benchmark": "longmemeval",
@@ -1400,8 +1584,11 @@ async def async_main() -> None:
                 "metrics_by_cutoff": metrics,
                 "evaluations": all_evaluations,
             })
+
+            # Step 33.8: 打印统一结果保存路径。
             print(f"\nResults saved to: {unified_path}")
 
+    # Step 34: 打印本次最终处理的问题数量。
     print(f"\nTotal questions processed: {len(all_evaluations)}")
 
 
