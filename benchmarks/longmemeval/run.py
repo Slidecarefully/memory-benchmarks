@@ -100,11 +100,18 @@ CHUNK_SIZE = 2  # messages per ingestion chunk (user+assistant pair)
 # RETRIEVAL JUDGE PROMPT
 # ===============================================================================
 
+# Step 1: 定义 retrieval 模式下 judge LLM 使用的 system prompt。
+# 这个 system prompt 用来约束 judge 的角色：
+# 它不是回答问题的模型，而是“严格但公平”的检索结果评估器；
+# 同时要求输出必须是 JSON，方便后续代码结构化解析。
 RETRIEVAL_JUDGE_SYSTEM = (
     "You are a strict but fair evaluator for a memory retrieval system. "
     "Return JSON only with the format requested."
 )
 
+# Step 2: 定义 retrieval judge 的用户提示词模板。
+# 这个 prompt 的作用是：让 judge LLM 判断“检索到的 memories 是否足够支持正确回答问题”。
+# 它不要求 judge 生成最终答案，而是要求 judge 判断检索结果是否覆盖了 ground truth answer 所需的核心信息。
 RETRIEVAL_JUDGE_PROMPT = """Determine whether the retrieved memories contain enough information to correctly answer the question.
 
 ## Evaluation Steps
@@ -153,19 +160,55 @@ def _format_retrieval_memories(
     question_date: str = "",
 ) -> str:
     """Format search results into a numbered list for the retrieval judge."""
+
+    # Step 3: 将 Mem0 search 返回的 memories 格式化成 judge prompt 里可读的文本。
+    # 输入 search_results 是一个 memory 结果列表；
+    # 输出是一个编号列表字符串，例如：
+    # 1. xxx (score=0.8231) [created: 2023-05-01T...]
+    #
+    # question_date 参数当前没有被实际使用，但保留在函数签名中，
+    # 方便后续如果需要按问题日期做格式化或过滤，可以直接扩展。
+
+    # Step 3.1: 如果没有检索结果，则返回 "(None)"。
+    # 这样 judge LLM 能明确知道当前没有任何 retrieved memories。
     if not search_results:
         return "(None)"
+
+    # Step 3.2: 初始化 lines，用于存放每条 memory 的格式化文本。
     lines = []
+
+    # Step 3.3: 遍历 search_results，并从 1 开始编号。
     for i, r in enumerate(search_results, 1):
+        # Step 3.4: 取出 memory 文本。
+        # 如果没有 memory 字段，则使用空字符串兜底。
         mem = r.get("memory", "")
+
+        # Step 3.5: 取出检索分数。
+        # 如果没有 score 字段，则默认为 0。
         score = r.get("score", 0)
+
+        # Step 3.6: 取出 memory 创建时间。
+        # created_at 后续会帮助 judge 判断冲突信息中的时间先后关系。
         created = r.get("created_at", "")
+
+        # Step 3.7: 先构造当前 memory 的主体部分：
+        # "{编号}. {memory内容}"。
         parts = [f"{i}. {mem}"]
+
+        # Step 3.8: 如果存在 score，则追加分数。
+        # 这里保留 4 位小数，避免 prompt 太长，同时给 judge 一个相关性参考。
         if score:
             parts.append(f"(score={score:.4f})")
+
+        # Step 3.9: 如果存在 created_at，则追加创建时间。
+        # 这对于 LongMemEval 中有时间顺序的问题尤其重要。
         if created:
             parts.append(f"[created: {created}]")
+
+        # Step 3.10: 将当前 memory 的各部分拼成一行，并加入 lines。
         lines.append(" ".join(parts))
+
+    # Step 3.11: 用换行符拼接所有 memory 行，作为 prompt 中的 Retrieved Memories 部分。
     return "\n".join(lines)
 
 
@@ -177,15 +220,39 @@ def get_retrieval_judge_prompt(
     user_profile: dict | None = None,
 ) -> str:
     """Build the retrieval mode judge prompt."""
+
+    # Step 4: 构造 retrieval judge 的完整 prompt。
+    # 这个函数把 question、ground truth answer、search results、question date、
+    # 以及可选 user_profile 填入 RETRIEVAL_JUDGE_PROMPT 模板。
+
+    # Step 4.1: 先把 search_results 格式化成 judge 可读的 memories 文本。
     memories_text = _format_retrieval_memories(search_results, question_date)
+
+    # Step 4.2: 初始化 user profile 文本区域。
+    # 默认没有 user profile。
     profile_section = ""
+
+    # Step 4.3: 如果提供了 user_profile，则将其格式化为多行文本。
+    # 这些 profile 信息会进入 judge prompt，帮助 judge 判断检索结果是否足够。
     if user_profile:
+        # Step 4.3.1: 写入 User Profile 标题。
         profile_lines = ["User Profile:"]
+
+        # Step 4.3.2: 遍历 user_profile 的键值对。
         for k, v in user_profile.items():
+            # Step 4.3.3: 只写入非 None 的 profile 字段。
             if v is not None:
                 profile_lines.append(f"  {k}: {v}")
+
+        # Step 4.3.4: 将 profile 行拼接成字符串。
         profile_section = "\n".join(profile_lines)
 
+    # Step 4.4: 将所有变量填入 RETRIEVAL_JUDGE_PROMPT 模板。
+    # 注意：
+    # - question_date 为空时填 "(not specified)"；
+    # - answer 会转成字符串；
+    # - num_memories 使用 search_results 的长度；
+    # - memories_text 是格式化后的 memory 列表。
     return RETRIEVAL_JUDGE_PROMPT.format(
         question=question,
         question_date=question_date or "(not specified)",
@@ -203,28 +270,52 @@ def get_retrieval_judge_prompt(
 
 def download_dataset(dataset_dir: str, logger: Any) -> str:
     """Download LongMemEval dataset from HuggingFace if not present."""
+
+    # Step 5: 确定 LongMemEval 数据集本地保存路径。
+    # DEFAULT_DATASET_FILE 是默认数据集文件名。
     path = os.path.join(dataset_dir, DEFAULT_DATASET_FILE)
+
+    # Step 5.1: 如果本地已经存在数据集文件，则直接返回路径，不重复下载。
     if os.path.exists(path):
         logger.info("Dataset already exists: %s", path)
         return path
 
+    # Step 5.2: 如果数据集不存在，则创建数据集目录。
     os.makedirs(dataset_dir, exist_ok=True)
+
+    # Step 5.3: 记录开始下载日志。
     logger.info("Downloading LongMemEval dataset...")
+
+    # Step 5.4: 从 DATASET_URL 下载数据集到本地 path。
+    # download_file 通常会处理进度条、HTTP 下载和文件写入。
     download_file(DATASET_URL, path, description="Downloading LongMemEval")
 
+    # Step 5.5: 下载完成后，读取 JSON 文件做基本合法性校验。
     with open(path) as f:
         data = json.load(f)
+
+    # Step 5.6: 校验数据集格式。
+    # 这里期望数据是 list，并且至少有 500 个问题。
+    # 如果校验失败，说明下载内容不对或文件损坏。
     if not isinstance(data, list) or len(data) < 500:
+        # Step 5.6.1: 删除无效文件，避免后续误用。
         os.remove(path)
+
+        # Step 5.6.2: 抛出异常，提示数据集不合法。
         raise RuntimeError(
             f"Invalid dataset: expected 500 questions, got {len(data)}"
         )
 
+    # Step 5.7: 记录下载成功日志。
     logger.info("Downloaded: %s (%d questions)", path, len(data))
+
+    # Step 5.8: 返回数据集路径。
     return path
 
 
 def load_dataset(path: str) -> list[dict]:
+    # Step 6: 从指定路径加载 LongMemEval 数据集。
+    # 数据集文件是 JSON 格式，返回值是 list[dict]。
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
@@ -241,25 +332,59 @@ def sample_questions_stratified(
     selected_types: list[str] | None = None,
 ) -> list[dict]:
     """Sample questions stratified by question_type."""
+
+    # Step 7: 按 question_type 分层抽样。
+    # 目标是从每一种问题类型中抽取 per_type 个问题，
+    # 避免只抽到某一种类型，导致小样本实验不均衡。
+
+    # Step 7.1: 确定要参与抽样的问题类型集合。
+    # 如果用户指定 selected_types，就只保留这些类型；
+    # 否则使用全局 QUESTION_TYPES。
     type_filter = set(selected_types) if selected_types else set(QUESTION_TYPES)
 
+    # Step 7.2: 创建 groups。
+    # key 是 question_type，value 是该类型下的问题列表。
     groups: dict[str, list[dict]] = defaultdict(list)
+
+    # Step 7.3: 遍历所有问题，把符合类型要求的问题放入对应分组。
     for q in questions:
         if q["question_type"] in type_filter:
             groups[q["question_type"]].append(q)
 
+    # Step 7.4: 对每个类型内部的问题按 question_id 排序。
+    # 这样可以保证在相同 seed 下抽样更加稳定、可复现。
     for qtype in groups:
         groups[qtype].sort(key=lambda q: q["question_id"])
 
+    # Step 7.5: 创建固定随机种子的随机数生成器。
+    # 使用 random.Random(seed) 而不是全局 random，
+    # 可以避免影响程序其他地方的随机性。
     rng = random.Random(seed)
+
+    # Step 7.6: 初始化 sampled，用于保存最终抽样结果。
     sampled = []
+
+    # Step 7.7: 按 question_type 的字典序遍历分组。
+    # 这样不同运行之间类型处理顺序稳定。
     for qtype in sorted(groups.keys()):
+        # Step 7.7.1: 取出当前类型的问题列表。
         group = groups[qtype]
+
+        # Step 7.7.2: 当前类型最多抽 per_type 个；
+        # 如果该类型问题数量不足 per_type，则全部抽取。
         n = min(per_type, len(group))
+
+        # Step 7.7.3: 从当前类型中随机抽取 n 个问题。
         selected = rng.sample(group, n)
+
+        # Step 7.7.4: 加入最终 sampled 列表。
         sampled.extend(selected)
 
+    # Step 7.8: 对所有抽样结果按 question_id 排序。
+    # 这样最终处理顺序稳定，便于复现实验和对比输出。
     sampled.sort(key=lambda q: q["question_id"])
+
+    # Step 7.9: 返回分层抽样后的问题列表。
     return sampled
 
 
@@ -270,21 +395,50 @@ def sample_questions_stratified(
 
 def parse_longmemeval_date(date_str: str) -> int | None:
     """Parse '2023/05/01 (Mon) 21:05' -> Unix epoch int (treated as UTC)."""
+
+    # Step 8: 将 LongMemEval 的日期字符串解析成 Unix epoch 秒。
+    # 原始格式类似：
+    # "2023/05/01 (Mon) 21:05"
+    # 输出是 int timestamp，并且按 UTC 处理。
     try:
+        # Step 8.1: 删除日期字符串中的星期部分，例如 "(Mon)"。
+        # 删除后得到类似 "2023/05/01 21:05"。
         cleaned = re.sub(r"\s*\([A-Za-z]+\)\s*", " ", date_str).strip()
+
+        # Step 8.2: 按 "%Y/%m/%d %H:%M" 格式解析时间。
+        # replace(tzinfo=timezone.utc) 表示将其视为 UTC 时间。
         dt = datetime.strptime(cleaned, "%Y/%m/%d %H:%M").replace(tzinfo=timezone.utc)
+
+        # Step 8.3: 转成 Unix epoch 秒并返回。
         return int(dt.timestamp())
+
     except (ValueError, TypeError):
+        # Step 8.4: 如果日期格式错误，或 date_str 类型不对，则返回 None。
         return None
 
 
 def parse_longmemeval_date_human(date_str: str) -> str:
     """Parse '2023/05/01 (Mon) 21:05' -> 'Monday, May 01, 2023'."""
+
+    # Step 9: 将 LongMemEval 的日期字符串转成更适合 prompt 阅读的日期格式。
+    # 原始格式：
+    # "2023/05/01 (Mon) 21:05"
+    # 输出格式：
+    # "Monday, May 01, 2023"
     try:
+        # Step 9.1: 删除星期缩写部分，例如 "(Mon)"。
         cleaned = re.sub(r"\s*\([A-Za-z]+\)\s*", " ", date_str).strip()
+
+        # Step 9.2: 按数据集原始时间格式解析。
+        # 注意这里没有设置 timezone，因为这里只是为了生成可读字符串。
         dt = datetime.strptime(cleaned, "%Y/%m/%d %H:%M")
+
+        # Step 9.3: 格式化成人类可读日期。
         return dt.strftime("%A, %B %d, %Y")
+
     except (ValueError, TypeError):
+        # Step 9.4: 如果解析失败，则返回原始字符串。
+        # 这样至少不会丢失原始 question_date 信息。
         return date_str
 
 
@@ -295,19 +449,46 @@ def sort_sessions_chronologically(
 
     Returns list of (session_id, date_str, session) tuples sorted by date.
     """
+
+    # Step 10: 将一个问题中的 haystack sessions 按时间排序。
+    # LongMemEval 中一个问题会包含多个 haystack session；
+    # 为了按真实时间顺序 ingest，需要根据 haystack_dates 对 sessions 排序。
+
+    # Step 10.1: 取出所有 haystack_sessions。
+    # 每个 session 是一段对话 turn 列表。
     sessions = question["haystack_sessions"]
+
+    # Step 10.2: 取出每个 session 对应的日期字符串。
     dates = question["haystack_dates"]
+
+    # Step 10.3: 取出每个 session 的 id。
     session_ids = question["haystack_session_ids"]
 
+    # Step 10.4: 将 session_id、date、session 三者配对。
+    # paired 中每个元素是：
+    # (session_id, date_str, session)
     paired = list(zip(session_ids, dates, sessions))
 
+    # Step 10.5: 定义排序 key。
+    # 能成功解析日期的 session 排在前面，并按 timestamp 升序；
+    # 不能解析日期的 session 排在后面，并按原始 date_str 做稳定排序。
     def sort_key(item: tuple) -> tuple:
+        # Step 10.5.1: 尝试解析当前 session 的日期。
         parsed = parse_longmemeval_date(item[1])
+
+        # Step 10.5.2: 如果日期解析成功，返回 (0, timestamp, 原始日期字符串)。
+        # 第一个元素 0 表示“可解析日期”，会排在不可解析日期之前。
         if parsed is not None:
             return (0, parsed, item[1])
+
+        # Step 10.5.3: 如果日期解析失败，返回 (1, 0, 原始日期字符串)。
+        # 第一个元素 1 表示“不可解析日期”，排在后面。
         return (1, 0, item[1])
 
+    # Step 10.6: 原地按 sort_key 排序。
     paired.sort(key=sort_key)
+
+    # Step 10.7: 返回排序后的 session 列表。
     return paired
 
 
@@ -316,11 +497,35 @@ def pair_turns(session: list[dict]) -> list[list[dict]]:
 
     Returns list of message pairs for Mem0 add() calls.
     """
+
+    # Step 11: 将一个 session 中的连续 turn 切分成 pair。
+    # LongMemEval 的 session 是一段多轮对话；
+    # Mem0 ingestion 时不是整个 session 一次 add，
+    # 而是每两个 turn 组成一个 pair 后调用一次 mem0.add。
+
+    # Step 11.1: 清理每个 turn，只保留 role 和 content。
+    # 这里会丢弃 has_answer 等数据集标注字段，
+    # 因为 mem0.add 只需要标准 message 格式。
     cleaned = [{"role": t["role"], "content": t["content"]} for t in session]
+
+    # Step 11.2: 初始化 pairs。
     pairs = []
+
+    # Step 11.3: 每隔两个 turn 取一组。
+    # 通常就是：
+    # [
+    #   {"role": "user", "content": "..."},
+    #   {"role": "assistant", "content": "..."}
+    # ]
     for i in range(0, len(cleaned), 2):
+        # Step 11.3.1: 取当前位置开始的两个 turn。
+        # 如果 session 长度是奇数，最后一个 pair 可能只有 1 条 message。
         pair = cleaned[i : i + 2]
+
+        # Step 11.3.2: 加入 pairs。
         pairs.append(pair)
+
+    # Step 11.4: 返回 pair 列表，供 ingest_question() 逐个调用 mem0.add。
     return pairs
 
 # ===============================================================================
