@@ -1282,27 +1282,72 @@ def compute_longmemeval_metrics(
     cutoffs: list[int],
 ) -> dict:
     """Compute per-question-type and overall metrics at each cutoff."""
+
+    # Step 1: 初始化总的 metrics 容器。
+    # 最终结构大致是：
+    # {
+    #   "top_5": {
+    #       "overall": {...},
+    #       "by_question_type": {...}
+    #   },
+    #   "top_10": {...}
+    # }
     metrics_by_cutoff = {}
+
+    # Step 2: 遍历每一个 cutoff。
+    # cutoff 表示只看前 c 条检索结果时的评测效果。
     for c in cutoffs:
+        # Step 2.1: 将 cutoff 数字转换成 label。
+        # 例如 c=5 可能变成 "top_5"。
         label = cutoff_label(c)
+
+        # Step 2.2: 统计当前参与评测的问题总数。
         total = len(evaluations)
+
+        # Step 2.3: 提取当前 cutoff 下每个 evaluation 的 score。
+        # 如果某条 evaluation 没有 cutoff_results / label / score，
+        # 则默认按 0.0 处理。
         scores = [
             e.get("cutoff_results", {}).get(label, {}).get("score", 0.0)
             for e in evaluations
         ]
+
+        # Step 2.4: 统计正确数量。
+        # 这里约定 score >= 0.5 就算正确 / PASS。
         correct = sum(1 for s in scores if s >= 0.5)
 
+        # Step 3: 按 question_type 分组收集 score。
+        # key 是 question_type，value 是该类型下所有问题的 score 列表。
         by_type: dict[str, list] = defaultdict(list)
+
+        # Step 3.1: 遍历所有 evaluation。
         for e in evaluations:
+            # Step 3.2: 获取问题类型。
+            # 如果没有 question_type，则归为 "unknown"。
             qtype = e.get("question_type", "unknown")
+
+            # Step 3.3: 将当前 cutoff 下的 score 加入对应 question_type 分组。
             by_type[qtype].append(
                 e.get("cutoff_results", {}).get(label, {}).get("score", 0.0)
             )
 
+        # Step 4: 初始化每种 question_type 的指标容器。
         type_metrics = {}
+
+        # Step 4.1: 按 question_type 字母序遍历，保证输出顺序稳定。
         for qtype in sorted(by_type):
+            # Step 4.2: 取出当前类型下所有分数。
             type_scores = by_type[qtype]
+
+            # Step 4.3: 统计当前类型下正确数量。
+            # 同样使用 score >= 0.5 作为正确标准。
             type_correct = sum(1 for s in type_scores if s >= 0.5)
+
+            # Step 4.4: 计算当前 question_type 的指标。
+            # total: 当前类型问题总数
+            # correct: 当前类型正确数
+            # accuracy: 正确率，百分比形式
+            # avg_score: 平均分，百分比形式
             type_metrics[qtype] = {
                 "total": len(type_scores),
                 "correct": type_correct,
@@ -1310,35 +1355,69 @@ def compute_longmemeval_metrics(
                 "avg_score": statistics.mean(type_scores) * 100 if type_scores else 0.0,
             }
 
+        # Step 5: 汇总当前 cutoff 下的 overall 指标和按类型指标。
         metrics_by_cutoff[label] = {
             "overall": {
+                # Step 5.1: 当前 cutoff 下参与评测的问题总数。
                 "total": total,
+
+                # Step 5.2: 当前 cutoff 下整体正确数量。
                 "correct": correct,
+
+                # Step 5.3: 当前 cutoff 下整体 accuracy。
+                # 如果 total=0，则返回 0.0，避免除零。
                 "accuracy": correct / total * 100 if total else 0.0,
+
+                # Step 5.4: 当前 cutoff 下整体平均 score。
+                # scores 为空时返回 0.0。
                 "avg_score": statistics.mean(scores) * 100 if scores else 0.0,
             },
+
+            # Step 5.5: 当前 cutoff 下，按 question_type 细分的指标。
             "by_question_type": type_metrics,
         }
+
+    # Step 6: 返回所有 cutoff 的指标结果。
     return metrics_by_cutoff
 
 
 def display_results(metrics_by_cutoff: dict, cutoffs: list[int]) -> None:
     """Print metrics to console."""
+
+    # Step 7: 将 compute_longmemeval_metrics() 计算好的指标打印到控制台。
+    # 该函数不做计算，只负责展示。
+
+    # Step 7.1: 按传入的 cutoffs 顺序逐个展示。
     for c in cutoffs:
+        # Step 7.2: 将 cutoff 转换成 label，例如 "top_5"。
         label = cutoff_label(c)
+
+        # Step 7.3: 取出当前 cutoff 对应的 metrics。
+        # 如果不存在，则使用空 dict 兜底。
         m = metrics_by_cutoff.get(label, {})
+
+        # Step 7.4: 取出 overall 指标。
         overall = m.get("overall", {})
+
+        # Step 7.5: 打印当前 cutoff 标题。
         print(f"\n--- {label} ---")
+
+        # Step 7.6: 打印整体结果。
+        # 格式类似：
+        # Overall: 42/50 (84.0%) avg=84.0%
         print(
             f"  Overall: {overall.get('correct', 0)}/{overall.get('total', 0)} "
             f"({overall.get('accuracy', 0):.1f}%) "
             f"avg={overall.get('avg_score', 0):.1f}%"
         )
+
+        # Step 7.7: 遍历并打印每种 question_type 的结果。
+        # sorted(...) 保证展示顺序稳定。
         for qtype, tm in sorted(m.get("by_question_type", {}).items()):
+            # Step 7.8: 打印当前 question_type 的正确数、总数和 accuracy。
             print(
                 f"  {qtype}: {tm['correct']}/{tm['total']} ({tm['accuracy']:.1f}%)"
             )
-
 
 # ===============================================================================
 # CLI
